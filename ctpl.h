@@ -1,4 +1,3 @@
-
 /*********************************************************
  *
  *  Copyright (C) 2014 by Vitaliy Vitsentiy
@@ -21,26 +20,56 @@
 #ifndef __ctpl_thread_pool_H__
 #define __ctpl_thread_pool_H__
 
-#include <functional>
-#include <thread>
-#include <atomic>
-#include <vector>
-#include <memory>
-#include <exception>
-#include <future>
-#include <mutex>
-#include <boost/lockfree/queue.hpp>
+#include <functional>  // 用于std::function和std::bind
+#include <thread>      // 用于std::thread线程管理
+#include <atomic>      // 用于std::atomic原子操作，保证线程安全
+#include <vector>      // 用于存储线程和标志
+#include <memory>      // 用于智能指针管理资源
+#include <exception>   // 用于异常处理
+#include <future>      // 用于std::future和std::packaged_task
+#include <mutex>       // 用于互斥锁和条件变量
+#include <boost/lockfree/queue.hpp>  // 使用Boost的无锁队列，提高并发性能
 
 
 #ifndef _ctplThreadPoolLength_
-#define _ctplThreadPoolLength_  100
+#define _ctplThreadPoolLength_  100  // 默认队列长度为100
 #endif
 
 
-// thread pool to run user's functors with signature
+/*********************************************************
+* 线程池实现 (基于Boost.Lockfree)
+*
+* 这个文件实现了一个高性能线程池，使用Boost库的无锁队列来管理任务队列，
+* 相比标准库的队列实现，无锁队列在高并发情况下性能更好，减少了线程间的竞争。
+*
+* 主要功能和特点：
+* 1. 提交任务到线程池：支持函数、函数对象、lambda表达式等多种可调用对象
+* 2. 动态调整线程池大小：可以根据负载情况增加或减少工作线程数量
+* 3. 等待所有任务完成：可以选择等待或立即停止
+* 4. 线程安全：使用原子操作和互斥锁保证多线程环境下的安全性
+* 5. 高效的任务分发：使用无锁队列减少线程间的竞争和等待
+* 6. 支持获取任务返回值：通过std::future机制
+* 7. 异常处理：任务中的异常可以通过future传递给调用者
+*
+* 线程安全考量：
+* - 使用boost::lockfree::queue实现无锁任务队列，避免了传统互斥锁的性能开销
+* - 使用std::atomic<bool>标志控制线程的停止，保证线程安全的终止
+* - 使用std::mutex和std::condition_variable实现线程同步和通知机制
+* - 使用智能指针管理资源，避免内存泄漏
+*
+* 性能考量：
+* - 无锁队列减少了线程间的竞争，提高了任务分发的效率
+* - 线程池避免了频繁创建和销毁线程的开销
+* - 使用条件变量使空闲线程进入等待状态，减少CPU资源消耗
+*********************************************************/
+
+
+// 线程池用于运行用户的函数对象，函数签名为：
 //      ret func(int id, other_params)
-// where id is the index of the thread that runs the functor
-// ret is some return type
+// 其中：
+// - id 是运行该函数的线程索引，可用于标识不同线程
+// - other_params 是用户传递的其他参数
+// - ret 是函数的返回类型，可以通过std::future获取
 
 
 namespace ctpl {
@@ -49,189 +78,381 @@ namespace ctpl {
 
     public:
 
+        /**
+         * @brief 默认构造函数，初始化线程池
+         *
+         * 创建一个空的线程池，使用默认队列大小(_ctplThreadPoolLength_)
+         * 需要调用resize()方法来添加工作线程
+         */
         thread_pool() : q(_ctplThreadPoolLength_) { this->init(); }
+
+        /**
+         * @brief 构造函数，指定线程数量和队列大小
+         *
+         * @param nThreads 线程池中的线程数量
+         * @param queueSize 任务队列的大小，默认为_ctplThreadPoolLength_
+         *
+         * 创建指定数量线程的线程池，并立即启动这些线程等待任务
+         */
         thread_pool(int nThreads, int queueSize = _ctplThreadPoolLength_) : q(queueSize) { this->init(); this->resize(nThreads); }
 
-        // the destructor waits for all the functions in the queue to be finished
+        /**
+         * @brief 析构函数，等待所有任务完成并停止线程池
+         *
+         * 调用stop(true)确保所有已提交的任务都被执行完毕
+         * 然后释放所有线程资源
+         */
         ~thread_pool() {
             this->stop(true);
         }
 
-        // get the number of running threads in the pool
+        /**
+         * @brief 获取线程池中线程的数量
+         *
+         * @return int 线程数量
+         */
         int size() { return static_cast<int>(this->threads.size()); }
 
-        // number of idle threads
+        /**
+         * @brief 获取当前空闲（等待任务）的线程数量
+         *
+         * @return int 空闲线程数量
+         *
+         * 线程安全：此方法返回原子变量，可以安全地从多个线程调用
+         */
         int n_idle() { return this->nWaiting; }
+
+        /**
+         * @brief 获取指定索引的线程引用
+         *
+         * @param i 线程索引
+         * @return std::thread& 线程引用
+         *
+         * 注意：调用者必须确保索引有效，否则会导致未定义行为
+         */
         std::thread & get_thread(int i) { return *this->threads[i]; }
 
-        // change the number of threads in the pool
-        // should be called from one thread, otherwise be careful to not interleave, also with this->stop()
-        // nThreads must be >= 0
+        /**
+         * @brief 动态调整线程池大小
+         *
+         * @param nThreads 新的线程数量，必须 >= 0
+         *
+         * 此方法可以在运行时增加或减少线程池中的线程数量：
+         * 1. 如果 nThreads > 当前线程数，则创建新线程
+         * 2. 如果 nThreads < 当前线程数，则停止多余的线程
+         *
+         * 线程安全考量：
+         * - 应该从单个线程调用，否则需要小心避免与其他resize()或stop()调用交错
+         * - 增加线程是安全的，可以并发执行
+         * - 减少线程时使用了线程分离(detach)而非终止(terminate)，确保线程可以安全完成当前任务
+         * - 使用原子标志通知线程停止，避免了强制终止可能导致的资源泄漏
+         */
         void resize(int nThreads) {
+            // 只有线程池未停止且未完成时才允许调整线程数
             if (!this->isStop && !this->isDone) {
-                int oldNThreads = static_cast<int>(this->threads.size());
-                if (oldNThreads <= nThreads) {  // if the number of threads is increased
-                    this->threads.resize(nThreads);
-                    this->flags.resize(nThreads);
+                int oldNThreads = static_cast<int>(this->threads.size()); // 当前线程数
+                if (oldNThreads <= nThreads) {  // 如果要增加线程数
+                    this->threads.resize(nThreads); // 扩展线程容器
+                    this->flags.resize(nThreads);   // 扩展标志容器
 
+                    // 创建新线程
                     for (int i = oldNThreads; i < nThreads; ++i) {
-                        this->flags[i] = std::make_shared<std::atomic<bool>>(false);
-                        this->set_thread(i);
+                        this->flags[i] = std::make_shared<std::atomic<bool>>(false); // 新线程的停止标志设为false
+                        this->set_thread(i); // 启动新线程，绑定工作函数
                     }
                 }
-                else {  // the number of threads is decreased
+                else {  // 如果要减少线程数
+                    // 标记多余线程的停止标志，并分离这些线程
                     for (int i = oldNThreads - 1; i >= nThreads; --i) {
-                        *this->flags[i] = true;  // this thread will finish
-                        this->threads[i]->detach();
+                        *this->flags[i] = true;  // 设置该线程的停止标志为true，通知其退出
+                        this->threads[i]->detach(); // 分离线程，使其在后台运行，主线程不再等待它
                     }
                     {
-                        // stop the detached threads that were waiting
+                        // 唤醒所有可能在等待任务的分离线程，让它们检测到停止标志后退出
                         std::unique_lock<std::mutex> lock(this->mutex);
                         this->cv.notify_all();
                     }
-                    this->threads.resize(nThreads);  // safe to delete because the threads are detached
-                    this->flags.resize(nThreads);  // safe to delete because the threads have copies of shared_ptr of the flags, not originals
+                    // 缩小线程和标志容器，安全删除多余元素
+                    this->threads.resize(nThreads);  // 只保留需要的线程对象
+                    this->flags.resize(nThreads);    // 只保留需要的标志对象
                 }
             }
         }
 
-        // empty the queue
+        /**
+         * @brief 清空任务队列
+         *
+         * 从队列中移除所有待处理的任务并释放资源
+         * 注意：此操作会丢弃所有未执行的任务
+         *
+         * 线程安全：
+         * - 使用无锁队列的pop操作是线程安全的
+         * - 但整体方法不是原子的，调用时应确保没有其他线程同时访问队列
+         */
         void clear_queue() {
             std::function<void(int id)> * _f;
             while (this->q.pop(_f))
-                delete _f;  // empty the queue
+                delete _f;  // 清空队列中的任务并释放内存
         }
 
-        // pops a functional wraper to the original function
+        /**
+         * @brief 从任务队列中弹出一个任务
+         *
+         * @return std::function<void(int)> 弹出的任务，如果队列为空则返回空函数
+         *
+         * 此方法允许手动从队列中取出任务并执行，主要用于特殊情况下的任务处理
+         *
+         * 线程安全：
+         * - 使用无锁队列的pop操作是线程安全的
+         * - 使用智能指针确保即使发生异常也能正确释放资源
+         */
         std::function<void(int)> pop() {
             std::function<void(int id)> * _f = nullptr;
-            this->q.pop(_f);
-            std::unique_ptr<std::function<void(int id)>> func(_f);  // at return, delete the function even if an exception occurred
-            
+            this->q.pop(_f);  // 从队列中弹出任务
+            std::unique_ptr<std::function<void(int id)>> func(_f);  // 使用智能指针管理资源，确保任务在返回时被删除
+
             std::function<void(int)> f;
             if (_f)
-                f = *_f;
-            return f;
+                f = *_f;  // 如果成功弹出任务，则复制任务内容
+            return f;  // 返回任务副本
         }
 
 
-        // wait for all computing threads to finish and stop all threads
-        // may be called asyncronously to not pause the calling thread while waiting
-        // if isWait == true, all the functions in the queue are run, otherwise the queue is cleared without running the functions
+        /**
+         * @brief 等待所有计算线程完成并停止所有线程
+         *
+         * @param isWait 是否等待队列中的所有任务完成，默认为false
+         *
+         * 此方法有两种工作模式：
+         * 1. isWait=true: 等待模式 - 执行队列中的所有任务，然后停止线程池
+         * 2. isWait=false: 立即停止模式 - 立即停止线程池，丢弃队列中未执行的任务
+         *
+         * 可以异步调用此方法，以便在等待时不阻塞调用线程
+         *
+         * 线程安全考量：
+         * - 使用原子变量isStop和isDone标记线程池状态，确保状态变更对所有线程可见
+         * - 使用条件变量通知所有等待的线程检查停止标志
+         * - 使用join等待所有线程安全退出，确保资源正确释放
+         * - 最后清理队列和容器，防止内存泄漏
+         */
         void stop(bool isWait = false) {
-            if (!isWait) {
+            if (!isWait) { // 不等待任务完成，直接停止
                 if (this->isStop)
-                    return;
-                this->isStop = true;
+                    return; // 已经停止则直接返回，避免重复操作
+                this->isStop = true; // 设置停止标志，所有线程看到此标志后会退出
+
+                // 通知所有线程停止
                 for (int i = 0, n = this->size(); i < n; ++i) {
-                    *this->flags[i] = true;  // command the threads to stop
+                    *this->flags[i] = true;  // 设置每个线程的停止标志
                 }
-                this->clear_queue();  // empty the queue
+                this->clear_queue();  // 立即清空任务队列，未执行的任务会被丢弃
             }
-            else {
+            else { // 等待所有任务完成后再停止
                 if (this->isDone || this->isStop)
-                    return;
-                this->isDone = true;  // give the waiting threads a command to finish
+                    return; // 已经完成或已停止则直接返回，避免重复操作
+                this->isDone = true;  // 设置完成标志，通知线程完成所有任务后退出
             }
             {
+                // 唤醒所有等待中的线程，让它们检测到停止/完成标志
                 std::unique_lock<std::mutex> lock(this->mutex);
-                this->cv.notify_all();  // stop all waiting threads
+                this->cv.notify_all();  // 唤醒所有等待线程
             }
-            for (int i = 0; i < static_cast<int>(this->threads.size()); ++i) {  // wait for the computing threads to finish
+
+            // 等待所有线程执行完毕
+            for (int i = 0; i < static_cast<int>(this->threads.size()); ++i) {
                 if (this->threads[i]->joinable())
-                    this->threads[i]->join();
+                    this->threads[i]->join(); // 等待线程结束，确保资源正确释放
             }
-            // if there were no threads in the pool but some functors in the queue, the functors are not deleted by the threads
-            // therefore delete them here
+
+            // 如果线程池中没有线程但队列中还有任务，需要手动清理这些任务
             this->clear_queue();
-            this->threads.clear();
-            this->flags.clear();
+            this->threads.clear(); // 清空线程容器
+            this->flags.clear();   // 清空标志容器
         }
 
+        /**
+         * @brief 提交带参数的任务到线程池
+         *
+         * @tparam F 函数类型
+         * @tparam Rest 参数类型包
+         * @param f 函数对象（函数指针、函数对象、lambda表达式等）
+         * @param rest 传递给函数的参数
+         * @return std::future<decltype(f(0, rest...))> 用于获取任务结果的future对象
+         *
+         * 此方法允许提交带有额外参数的任务到线程池，并返回一个future对象用于获取结果
+         *
+         * 实现细节：
+         * 1. 使用std::bind将函数和参数绑定，第一个参数为线程ID
+         * 2. 使用std::packaged_task包装任务，以便获取返回值
+         * 3. 使用std::function包装packaged_task，统一任务接口
+         * 4. 将任务推入无锁队列
+         * 5. 通知一个等待的线程处理新任务
+         *
+         * 线程安全考量：
+         * - 使用无锁队列安全地添加任务，避免了互斥锁的开销
+         * - 使用智能指针管理packaged_task的生命周期，确保即使线程池销毁也能正确获取结果
+         * - 使用完美转发(std::forward)保留参数的值类别，提高效率
+         */
         template<typename F, typename... Rest>
         auto push(F && f, Rest&&... rest) ->std::future<decltype(f(0, rest...))> {
+            // 1. 创建 packaged_task，将任务和参数绑定，返回值类型为 f(0, rest...)
             auto pck = std::make_shared<std::packaged_task<decltype(f(0, rest...))(int)>>(
                 std::bind(std::forward<F>(f), std::placeholders::_1, std::forward<Rest>(rest)...)
             );
 
+            // 2. 创建 function<void(int)>，包装 packaged_task，便于线程池统一调用
             auto _f = new std::function<void(int id)>([pck](int id) {
-                (*pck)(id);
+                (*pck)(id); // 执行 packaged_task
             });
+            // 3. 将任务指针推入无锁队列
             this->q.push(_f);
 
+            // 4. 唤醒一个等待中的线程来执行新任务
             std::unique_lock<std::mutex> lock(this->mutex);
             this->cv.notify_one();
 
+            // 5. 返回 future，用户可通过 get() 获取任务结果
             return pck->get_future();
         }
 
-        // run the user's function that excepts argument int - id of the running thread. returned value is templatized
-        // operator returns std::future, where the user can get the result and rethrow the catched exceptins
+        /**
+         * @brief 提交无额外参数的任务到线程池
+         *
+         * @tparam F 函数类型
+         * @param f 函数对象（函数指针、函数对象、lambda表达式等）
+         * @return std::future<decltype(f(0))> 用于获取任务结果的future对象
+         *
+         * 此方法是push的简化版本，用于提交只接受线程ID参数的任务
+         *
+         * 实现细节：
+         * 1. 使用std::packaged_task包装任务，以便获取返回值
+         * 2. 使用std::function包装packaged_task，统一任务接口
+         * 3. 将任务推入无锁队列
+         * 4. 通知一个等待的线程处理新任务
+         *
+         * 线程安全考量：
+         * - 与带参数版本相同，确保线程安全的任务提交
+         * - 使用完美转发(std::forward)保留函数对象的值类别，提高效率
+         *
+         * 异常处理：
+         * - 任务中抛出的异常会被packaged_task捕获，并通过future传递给调用者
+         * - 调用者可以通过future.get()重新抛出异常
+         */
         template<typename F>
         auto push(F && f) ->std::future<decltype(f(0))> {
+            // 1. 创建 packaged_task，任务类型为 f(0)
             auto pck = std::make_shared<std::packaged_task<decltype(f(0))(int)>>(std::forward<F>(f));
 
+            // 2. 创建 function<void(int)>，包装 packaged_task
             auto _f = new std::function<void(int id)>([pck](int id) {
-                (*pck)(id);
+                (*pck)(id); // 执行 packaged_task
             });
+            // 3. 推入无锁队列
             this->q.push(_f);
 
+            // 4. 唤醒一个等待线程
             std::unique_lock<std::mutex> lock(this->mutex);
             this->cv.notify_one();
 
+            // 5. 返回 future
             return pck->get_future();
         }
 
 
     private:
 
-        // deleted
+        /**
+         * @brief 删除的拷贝和移动构造/赋值函数
+         *
+         * 线程池不支持拷贝和移动操作，因为这些操作可能导致线程资源管理混乱
+         * 使用注释而非C++11的=delete语法是为了兼容旧编译器
+         */
         thread_pool(const thread_pool &);// = delete;
         thread_pool(thread_pool &&);// = delete;
         thread_pool & operator=(const thread_pool &);// = delete;
         thread_pool & operator=(thread_pool &&);// = delete;
 
+        /**
+         * @brief 设置线程的工作函数
+         *
+         * @param i 线程索引
+         *
+         * 此方法为每个线程创建工作函数，并启动线程
+         * 工作函数的主要逻辑：
+         * 1. 不断从队列中获取任务并执行
+         * 2. 队列为空时等待条件变量通知
+         * 3. 收到停止信号时安全退出
+         *
+         * 线程安全考量：
+         * - 使用共享指针复制线程停止标志，确保即使线程池被销毁，线程也能安全访问标志
+         * - 使用智能指针管理任务对象，确保即使发生异常也能正确释放资源
+         * - 使用条件变量和互斥锁实现线程等待和唤醒机制，减少CPU资源消耗
+         * - 使用原子操作更新等待线程计数，确保计数的线程安全
+         */
         void set_thread(int i) {
-            std::shared_ptr<std::atomic<bool>> flag(this->flags[i]);  // a copy of the shared ptr to the flag
-            auto f = [this, i, flag/* a copy of the shared ptr to the flag */]() {
-                std::atomic<bool> & _flag = *flag;
-                std::function<void(int id)> * _f;
-                bool isPop = this->q.pop(_f);
+            // 复制线程停止标志的共享指针，确保线程可以安全访问标志，即使线程池被销毁
+            std::shared_ptr<std::atomic<bool>> flag(this->flags[i]);
+
+            // 定义线程的工作函数
+            auto f = [this, i, flag]() {
+                std::atomic<bool> & _flag = *flag;  // 线程停止标志的引用
+                std::function<void(int id)> * _f;   // 任务指针
+                bool isPop = this->q.pop(_f);       // 尝试从队列中弹出一个任务
+
                 while (true) {
-                    while (isPop) {  // if there is anything in the queue
-                        std::unique_ptr<std::function<void(int id)>> func(_f);  // at return, delete the function even if an exception occurred
-                        (*_f)(i);
+                    while (isPop) {  // 如果队列中有任务
+                        // 使用智能指针管理任务对象，确保即使发生异常也能正确释放资源
+                        std::unique_ptr<std::function<void(int id)>> func(_f);
+                        (*_f)(i);  // 执行任务，传入线程索引
 
                         if (_flag)
-                            return;  // the thread is wanted to stop, return even if the queue is not empty yet
+                            return;  // 如果线程被标记为停止，则立即退出，即使队列不为空
                         else
-                            isPop = this->q.pop(_f);
+                            isPop = this->q.pop(_f);  // 继续尝试获取下一个任务
                     }
 
-                    // the queue is empty here, wait for the next command
+                    // 队列为空，等待新任务或停止信号
                     std::unique_lock<std::mutex> lock(this->mutex);
-                    ++this->nWaiting;
-                    this->cv.wait(lock, [this, &_f, &isPop, &_flag](){ isPop = this->q.pop(_f); return isPop || this->isDone || _flag; });
-                    --this->nWaiting;
+                    ++this->nWaiting;  // 增加等待线程计数
 
-                    if (!isPop)
-                        return;  // if the queue is empty and this->isDone == true or *flag then return
+                    // 等待条件变量通知，同时检查三个条件：有新任务、线程池完成标志、线程停止标志
+                    this->cv.wait(lock, [this, &_f, &isPop, &_flag](){
+                        isPop = this->q.pop(_f);  // 再次尝试获取任务
+                        return isPop || this->isDone || _flag;  // 如果有任务或需要停止，则退出等待
+                    });
+
+                    --this->nWaiting;  // 减少等待线程计数
+
+                    if (!isPop)  // 如果没有获取到任务，说明是因为停止信号而退出等待
+                        return;  // 退出线程
                 }
             };
-            this->threads[i].reset(new std::thread(f));  // compiler may not support std::make_unique()
+
+            // 创建并启动线程，使用reset而非make_unique是为了兼容旧编译器
+            this->threads[i].reset(new std::thread(f));
         }
 
-        void init() { this->nWaiting = 0; this->isStop = false; this->isDone = false; }
+        /**
+         * @brief 初始化线程池状态
+         *
+         * 重置所有状态变量为初始值
+         */
+        void init() {
+            this->nWaiting = 0;    // 初始化等待线程数为0
+            this->isStop = false;  // 初始化停止标志为false
+            this->isDone = false;  // 初始化完成标志为false
+        }
 
-        std::vector<std::unique_ptr<std::thread>> threads;
-        std::vector<std::shared_ptr<std::atomic<bool>>> flags;
-        mutable boost::lockfree::queue<std::function<void(int id)> *> q;
-        std::atomic<bool> isDone;
-        std::atomic<bool> isStop;
-        std::atomic<int> nWaiting;  // how many threads are waiting
+        // 成员变量
+        std::vector<std::unique_ptr<std::thread>> threads;  // 线程容器，使用智能指针管理线程生命周期
+        std::vector<std::shared_ptr<std::atomic<bool>>> flags;  // 线程停止标志，每个线程一个
+        mutable boost::lockfree::queue<std::function<void(int id)> *> q;  // 无锁任务队列，提高并发性能
+        std::atomic<bool> isDone;  // 是否完成标志，true表示需要完成所有任务后停止
+        std::atomic<bool> isStop;  // 是否停止标志，true表示立即停止，不处理剩余任务
+        std::atomic<int> nWaiting;  // 等待中的线程数量，用于监控线程池状态
 
-        std::mutex mutex;
-        std::condition_variable cv;
+        std::mutex mutex;  // 互斥锁，用于保护条件变量
+        std::condition_variable cv;  // 条件变量，用于线程等待和通知
     };
 
 }
